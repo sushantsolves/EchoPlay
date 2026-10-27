@@ -1,0 +1,6 @@
+{
+  "appId": "com.echoplay.music",
+  "appName": "EchoPlay",
+  "webDir": "www",
+  "bundledWebRuntime": false
+}

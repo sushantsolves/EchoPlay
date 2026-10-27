@@ -1,0 +1,25 @@
+{
+  "name": "EchoPlay \u2014 Your Music, Your Rules",
+  "short_name": "EchoPlay",
+  "description": "A personal offline music player with repeat controls.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#100b1d",
+  "theme_color": "#100b1d",
+  "icons": [
+    {
+      "src": "./assets/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./assets/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
