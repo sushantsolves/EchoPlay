@@ -257,7 +257,7 @@
 
   document.getElementById("themeButton").addEventListener("click", () => {
     document.body.classList.toggle("light");
-    document.getElementById("themeButton").textContent = document.body.classList.contains("light") ? "☾" : "☼";
+    document.getElementById("themeButton").innerHTML = `<span>${document.body.classList.contains("light") ? "☾" : "◐"}</span> Switch appearance`;
   });
 
   if ("mediaSession" in navigator) {
