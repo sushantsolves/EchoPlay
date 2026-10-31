@@ -8,10 +8,11 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.OpenableColumns;
 import android.database.Cursor;
 
-import androidx.core.content.ContextCompat;
 import androidx.documentfile.provider.DocumentFile;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.MediaMetadata;
@@ -34,6 +35,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
 
@@ -41,12 +43,13 @@ import java.util.function.Consumer;
 public class EchoPlayNativePlugin extends Plugin {
     private static final String PREFS = "echoplay_library";
     private static final String LIBRARY_KEY = "tracks";
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private MediaController controller;
     private ListenableFuture<MediaController> controllerFuture;
     private boolean playerListenerAttached = false;
-    private String desiredRepeatMode = "all";
-    private boolean desiredShuffle = false;
-    private float desiredVolume = 1.0f;
+    private volatile String desiredRepeatMode = "all";
+    private volatile boolean desiredShuffle = false;
+    private volatile float desiredVolume = 1.0f;
 
     @Override
     public void load() {
@@ -121,10 +124,22 @@ public class EchoPlayNativePlugin extends Plugin {
     }
 
     private void scanFolder(DocumentFile directory) {
-        DocumentFile[] children = directory.listFiles();
-        for (DocumentFile child : children) {
-            if (child.isDirectory()) scanFolder(child);
-            else if (child.isFile() && isAudio(child.getName(), child.getType())) addTrack(child.getUri());
+        try {
+            DocumentFile[] children = directory.listFiles();
+            if (children == null) return;
+            for (DocumentFile child : children) {
+                try {
+                    if (child.isDirectory()) {
+                        scanFolder(child);
+                    } else if (child.isFile() && isAudio(child.getName(), child.getType())) {
+                        addTrack(child.getUri());
+                    }
+                } catch (SecurityException ignored) {
+                    // Skip a child that the selected document provider does not expose.
+                }
+            }
+        } catch (SecurityException ignored) {
+            // Keep importing accessible files even if a nested directory is restricted.
         }
     }
 
@@ -247,19 +262,40 @@ public class EchoPlayNativePlugin extends Plugin {
     }
 
     @PluginMethod
-    public void seekTo(PluginCall call) {
-        long position = call.getLong("position", 0L);
-        withController(call, c -> { c.seekTo(Math.max(0L, position)); call.resolve(); });
-    }
+public void seekTo(PluginCall call) {
+    double requestedPosition = call.getData().optDouble("position", 0.0);
+    long position = Math.max(0L, Math.round(requestedPosition));
+
+    android.util.Log.d("EchoPlaySeek", "Requested position: " + position + " ms");
+
+    withController(call, c -> {
+        c.seekTo(position);
+
+        android.util.Log.d(
+            "EchoPlaySeek",
+            "Player position after seek request: " + c.getCurrentPosition() + " ms"
+        );
+
+        call.resolve(
+            new JSObject()
+                .put("requestedPosition", position)
+        );
+    });
+}
 
     @PluginMethod
     public void setRepeatMode(PluginCall call) {
         String mode = call.getString("mode", "all");
         desiredRepeatMode = mode;
-        if (controller == null) { call.resolve(); return; }
-        withController(call, c -> {
-            c.setRepeatMode("one".equals(mode) ? Player.REPEAT_MODE_ONE : "off".equals(mode) ? Player.REPEAT_MODE_OFF : Player.REPEAT_MODE_ALL);
-            call.resolve();
+        mainHandler.post(() -> {
+            if (controller == null) {
+                call.resolve();
+                return;
+            }
+            runControllerAction(call, controller, c -> {
+                c.setRepeatMode(repeatModeValue(mode));
+                call.resolve();
+            });
         });
     }
 
@@ -267,33 +303,83 @@ public class EchoPlayNativePlugin extends Plugin {
     public void setShuffleEnabled(PluginCall call) {
         boolean enabled = call.getBoolean("enabled", false);
         desiredShuffle = enabled;
-        if (controller == null) { call.resolve(); return; }
-        withController(call, c -> { c.setShuffleModeEnabled(enabled); call.resolve(); });
+        mainHandler.post(() -> {
+            if (controller == null) {
+                call.resolve();
+                return;
+            }
+            runControllerAction(call, controller, c -> {
+                c.setShuffleModeEnabled(enabled);
+                call.resolve();
+            });
+        });
     }
-
-
 
     @PluginMethod
     public void setVolume(PluginCall call) {
         double volume = call.getDouble("volume", 1.0);
         desiredVolume = (float) Math.max(0.0, Math.min(1.0, volume));
-        if (controller == null) { call.resolve(); return; }
-        withController(call, c -> { c.setVolume(desiredVolume); call.resolve(); });
+        mainHandler.post(() -> {
+            if (controller == null) {
+                call.resolve();
+                return;
+            }
+            runControllerAction(call, controller, c -> {
+                c.setVolume(desiredVolume);
+                call.resolve();
+            });
+        });
     }
 
     @PluginMethod
     public void stopPlayback(PluginCall call) {
-        if (controller == null) { call.resolve(); return; }
-        controller.pause();
-        controller.clearMediaItems();
-        controller.stop();
-        call.resolve();
+        mainHandler.post(() -> {
+            if (controller == null) {
+                call.resolve();
+                return;
+            }
+            runControllerAction(call, controller, c -> {
+                c.pause();
+                c.clearMediaItems();
+                c.stop();
+                call.resolve();
+            });
+        });
     }
 
     @PluginMethod
     public void getPlaybackState(PluginCall call) {
-        if (controller == null) { call.resolve(new JSObject().put("isPlaying", false).put("currentIndex", -1).put("position", 0).put("duration", 0)); return; }
-        call.resolve(snapshot(controller));
+        mainHandler.post(() -> {
+            if (controller == null) {
+                call.resolve(idlePlaybackState());
+                return;
+            }
+            runControllerAction(call, controller, c -> call.resolve(snapshot(c)));
+        });
+    }
+
+    private JSObject idlePlaybackState() {
+        return new JSObject().put("isPlaying", false).put("currentIndex", -1)
+                .put("position", 0).put("duration", 0);
+    }
+
+    private int repeatModeValue(String mode) {
+        return "one".equals(mode) ? Player.REPEAT_MODE_ONE
+                : "off".equals(mode) ? Player.REPEAT_MODE_OFF
+                : Player.REPEAT_MODE_ALL;
+    }
+
+    private void runControllerAction(PluginCall call, MediaController target,
+                                     Consumer<MediaController> action) {
+        // MediaController methods MUST run on its own application looper.
+        Handler controllerHandler = new Handler(target.getApplicationLooper());
+        controllerHandler.post(() -> {
+            try {
+                action.accept(target);
+            } catch (RuntimeException e) {
+                call.reject("Android playback operation failed.", e);
+            }
+        });
     }
 
     private JSObject snapshot(Player player) {
@@ -308,25 +394,40 @@ public class EchoPlayNativePlugin extends Plugin {
     }
 
     private void withController(PluginCall call, Consumer<MediaController> action) {
-        if (controller != null) { action.accept(controller); return; }
-        if (controllerFuture == null) {
-            Context context = getContext();
-            Intent serviceIntent = new Intent(context, EchoPlaybackService.class);
-            ContextCompat.startForegroundService(context, serviceIntent);
-            SessionToken token = new SessionToken(context, new ComponentName(context, EchoPlaybackService.class));
-            controllerFuture = new MediaController.Builder(context, token).buildAsync();
-        }
-        ListenableFuture<MediaController> future = controllerFuture;
-        future.addListener(() -> {
-            try {
-                controller = future.get();
-                attachPlayerListener(controller);
-                action.accept(controller);
-            } catch (ExecutionException | InterruptedException e) {
-                controllerFuture = null;
-                call.reject("Could not connect to the Android playback service.", e);
+        // Serialize controller creation and access on the main looper. The builder is
+        // explicitly configured to use this same looper, avoiding bridge-thread races.
+        mainHandler.post(() -> {
+            if (controller != null) {
+                runControllerAction(call, controller, action);
+                return;
             }
-        }, ContextCompat.getMainExecutor(getContext()));
+
+            if (controllerFuture == null) {
+                Context context = getContext();
+                SessionToken token = new SessionToken(
+                        context, new ComponentName(context, EchoPlaybackService.class));
+                controllerFuture = new MediaController.Builder(context, token)
+                        .setApplicationLooper(Looper.getMainLooper())
+                        .buildAsync();
+            }
+
+            ListenableFuture<MediaController> future = controllerFuture;
+            future.addListener(() -> {
+                try {
+                    MediaController connected = future.get();
+                    controller = connected;
+                    attachPlayerListener(connected);
+                    runControllerAction(call, connected, action);
+                } catch (ExecutionException | CancellationException e) {
+                    controllerFuture = null;
+                    call.reject("Could not connect to the Android playback service.", e);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    controllerFuture = null;
+                    call.reject("Connection to the Android playback service was interrupted.", e);
+                }
+            }, command -> mainHandler.post(command));
+        });
     }
 
     private void attachPlayerListener(MediaController player) {

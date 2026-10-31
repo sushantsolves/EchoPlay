@@ -14,6 +14,7 @@ public final class EchoPlaybackService extends MediaSessionService {
     @Override
     public void onCreate() {
         super.onCreate();
+
         player = new ExoPlayer.Builder(this).build();
         AudioAttributes audioAttributes = new AudioAttributes.Builder()
                 .setUsage(C.USAGE_MEDIA)
@@ -22,6 +23,9 @@ public final class EchoPlaybackService extends MediaSessionService {
         player.setAudioAttributes(audioAttributes, true);
         player.setWakeMode(C.WAKE_MODE_LOCAL);
         player.setHandleAudioBecomingNoisy(true);
+
+        // MediaSessionService manages its media notification and foreground state
+        // when playback starts. Do not call startForegroundService() manually here.
         mediaSession = new MediaSession.Builder(this, player).build();
     }
 
