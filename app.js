@@ -53,6 +53,13 @@
   let nativeIsPlaying = false;
   let nativePosition = 0;
   let nativeDuration = 0;
+  let isSeeking = false;
+  let pendingSeekPosition = null;
+
+  // Keep the progress slider scale consistent.
+  progress.min = "0";
+  progress.max = "1000";
+  progress.step = "1";
 
   const formatTime = seconds => {
     if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
@@ -254,20 +261,45 @@
     showToast(repeatLabel.textContent);
   }
 
-  function applyNativeState(state) {
+
+function applyNativeState(state) {
     if (!state) return;
-    if (Number.isInteger(state.currentIndex) && state.currentIndex >= 0 && state.currentIndex < tracks.length) {
-      currentIndex = state.currentIndex;
+
+    if (
+        Number.isInteger(state.currentIndex) &&
+        state.currentIndex >= 0 &&
+        state.currentIndex < tracks.length
+    ) {
+        currentIndex = state.currentIndex;
     }
+
     nativeIsPlaying = Boolean(state.isPlaying);
     nativePosition = Number(state.position || 0);
     nativeDuration = Number(state.duration || 0);
-    currentTime.textContent = formatTime(nativePosition / 1000);
+
     duration.textContent = formatTime(nativeDuration / 1000);
-    if (nativeDuration > 0) progress.value = String(Math.round(nativePosition / nativeDuration * 1000));
+
+    // Wait until Android confirms the requested seek position.
+    if (pendingSeekPosition !== null) {
+        if (Math.abs(nativePosition - pendingSeekPosition) <= 1500) {
+            pendingSeekPosition = null;
+            isSeeking = false;
+        }
+    }
+
+    if (!isSeeking && pendingSeekPosition === null) {
+        currentTime.textContent = formatTime(nativePosition / 1000);
+
+        if (nativeDuration > 0) {
+            progress.value = String(
+                Math.round((nativePosition / nativeDuration) * 1000)
+            );
+        }
+    }
+
     updateCurrentInfo(nativeIsPlaying);
     renderTracks();
-  }
+}
 
   function updateNativeLibrary(result) {
     const previousId = currentIndex >= 0 ? tracks[currentIndex]?.id : null;
@@ -393,37 +425,140 @@
     }
   } else {
     volume.addEventListener("input", () => native.setVolume({ volume: Number(volume.value) }).catch(console.error));
+    // User starts dragging the seek bar.
+
+
+    // Start seeking when the user touches the slider.
+    progress.addEventListener("pointerdown", () => {
+        isSeeking = true;
+    });
+
+    // Preview the selected timestamp while dragging.
     progress.addEventListener("input", () => {
-      if (nativeDuration > 0) native.seekTo({ position: Math.round(Number(progress.value) / 1000 * nativeDuration) }).catch(console.error);
+        if (nativeDuration > 0) {
+            const previewPosition =
+                (Number(progress.value) / 1000) * nativeDuration;
+
+            currentTime.textContent = formatTime(previewPosition / 1000);
+        }
     });
+
+    // Prevent multiple seek requests at the same time.
+    let seekInProgress = false;
+
+    
+async function commitSeek() {
+    if (!isSeeking || seekInProgress) return;
+
+    if (nativeDuration <= 0) {
+        isSeeking = false;
+        return;
+    }
+
+    seekInProgress = true;
+
+    const targetPosition = Math.max(
+        0,
+        Math.min(
+            nativeDuration,
+            Math.round((Number(progress.value) / 1000) * nativeDuration)
+        )
+    );
+
+    pendingSeekPosition = targetPosition;
+
+    console.log("EchoPlay: Sending seek position:", targetPosition);
+
+    try {
+        const result = await native.seekTo({
+            position: targetPosition
+        });
+
+        console.log("EchoPlay: Android received:", result);
+
+    } catch (error) {
+        console.error("EchoPlay seek error:", error);
+
+        showToast("Could not seek. Please try again.");
+
+        pendingSeekPosition = null;
+        isSeeking = false;
+
+    } finally {
+        seekInProgress = false;
+    }
+}
+
+
+    // Commit the seek when the user releases the slider.
+    progress.addEventListener("pointerup", commitSeek);
+    progress.addEventListener("change", commitSeek);
+
+    // Handle interrupted dragging.
+    progress.addEventListener("pointercancel", () => {
+        isSeeking = false;
+    });
+
+    // Listen for playback updates from Android.
     native.addListener("playbackState", applyNativeState);
-    native.setVolume({ volume: Number(volume.value) }).catch(console.error);
+
+    native.setVolume({
+        volume: Number(volume.value)
+    }).catch(console.error);
+
+    // Restore the saved music library and playback state.
     native.getLibrary().then(async result => {
-      updateNativeLibrary(result);
-      try { applyNativeState(await native.getPlaybackState()); } catch (error) { console.error(error); }
+        updateNativeLibrary(result);
+
+        try {
+            applyNativeState(await native.getPlaybackState());
+        } catch (error) {
+            console.error(error);
+        }
     }).catch(error => {
-      console.error("EchoPlay library restore error:", error);
-      showToast("Could not restore your saved library.");
+        console.error("EchoPlay library restore error:", error);
+        showToast("Could not restore your saved library.");
     });
-    window.setInterval(() => native.getPlaybackState().then(applyNativeState).catch(() => {}), 1000);
+
+    // Keep playback information synchronized.
+    window.setInterval(() => {
+        native.getPlaybackState()
+            .then(applyNativeState)
+            .catch(() => {});
+    }, 1000);
   }
 
   document.getElementById("themeButton").addEventListener("click", () => {
     document.body.classList.toggle("light");
-    document.getElementById("themeButton").innerHTML = `<span>${document.body.classList.contains("light") ? "☾" : "◐"}</span> Switch appearance`;
+
+    document.getElementById("themeButton").innerHTML =
+        `<span>${document.body.classList.contains("light") ? "☾" : "◐"}</span> Switch appearance`;
   });
 
   const dropZone = document.getElementById("dropZone");
-  ["dragenter", "dragover"].forEach(type => dropZone.addEventListener(type, event => {
-    event.preventDefault(); dropZone.classList.add("dragging");
-  }));
-  ["dragleave", "drop"].forEach(type => dropZone.addEventListener(type, event => {
-    event.preventDefault(); dropZone.classList.remove("dragging");
-  }));
-  dropZone.addEventListener("drop", event => { if (!isNative) addWebFiles(event.dataTransfer.files); });
+
+  ["dragenter", "dragover"].forEach(type => {
+    dropZone.addEventListener(type, event => {
+        event.preventDefault();
+        dropZone.classList.add("dragging");
+    });
+  });
+
+  ["dragleave", "drop"].forEach(type => {
+    dropZone.addEventListener(type, event => {
+        event.preventDefault();
+        dropZone.classList.remove("dragging");
+    });
+  });
+
+  dropZone.addEventListener("drop", event => {
+    if (!isNative) addWebFiles(event.dataTransfer.files);
+  });
 
   if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
-    window.addEventListener("load", () => navigator.serviceWorker.register("./service-worker.js").catch(() => {}));
+    window.addEventListener("load", () => {
+        navigator.serviceWorker.register("./service-worker.js").catch(() => {});
+    });
   }
 
   if (isNative) {
