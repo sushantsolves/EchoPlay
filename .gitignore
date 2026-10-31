@@ -1,5 +1,5 @@
 node_modules/
-www/
-android/
 .DS_Store
 Thumbs.db
+# Generated web build output (run npm run build before cap sync)
+www/
